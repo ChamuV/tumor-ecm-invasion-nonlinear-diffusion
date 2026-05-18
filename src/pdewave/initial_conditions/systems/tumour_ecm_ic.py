@@ -1,4 +1,4 @@
-# src/pdewave/initial_conditions/system_initial_conditions/tumour_ecm_ic.py
+# src/pdewave/initial_conditions/systems/tumour_ecm_ic.py
 
 import numpy as np
 

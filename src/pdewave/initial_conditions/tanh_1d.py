@@ -1,4 +1,4 @@
-# src/pdewave/initial_conditions/tahn_1d.py
+# src/pdewave/initial_conditions/tanh_1d.py
 
 import numpy as np
 
