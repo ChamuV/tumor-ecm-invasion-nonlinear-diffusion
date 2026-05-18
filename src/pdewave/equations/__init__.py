@@ -1,0 +1,1 @@
+# src/pdewave/equations/__init__.py
