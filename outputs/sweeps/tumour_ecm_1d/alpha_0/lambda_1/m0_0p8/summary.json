@@ -1,0 +1,22 @@
+{
+  "lambda": 1.0,
+  "m0": 0.8,
+  "alpha": 0.0,
+  "wave_speed": 0.8101274328661674,
+  "r2": 0.9999711733472856,
+  "m_threshold": 0.4,
+  "m_wave_speed": 0.8099929498114244,
+  "m_r2": 0.9999715761244797,
+  "untracked": false,
+  "untracked_reasons": [],
+  "r2_cutoff": 0.999,
+  "L": 200,
+  "N": 20001,
+  "T": 200,
+  "dt": 0.1,
+  "init_type": "tanh",
+  "steepness": 0.85,
+  "perc": 0.4,
+  "saved_stride": 150,
+  "run_dir": "/Users/chamu/tumor-ecm-invasion-nonlinear-diffusion/outputs/sweeps/tumour_ecm_1d/alpha_0/lambda_1/m0_0p8"
+}
