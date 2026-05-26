@@ -1,6 +1,4 @@
-# # run_files/run_asymptotics_all.py
-
-# run_files/run_asymptotics.py
+# run_files/run_asymptotics_all.py
 
 import sys
 from pathlib import Path
