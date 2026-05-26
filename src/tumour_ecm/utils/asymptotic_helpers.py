@@ -3,7 +3,6 @@
 from pathlib import Path
 
 import numpy as np
-
 from scipy.interpolate import PchipInterpolator, interp1d
 from scipy.optimize import root_scalar
 
@@ -15,10 +14,8 @@ def fmt_pow10(value):
 
     if np.isclose(value, 0.0):
         return "0"
-
     if np.isclose(value, 1.0):
         return "1"
-
     if np.isclose(value, 10.0):
         return "10"
 
@@ -32,12 +29,7 @@ def fmt_pow10(value):
 
 
 def load_run_for_asymptotics(base_dir, lam, alpha, m0):
-    run_dir = find_run_dir(
-        base_dir=base_dir,
-        lam=lam,
-        alpha=alpha,
-        m0=m0,
-    )
+    run_dir = find_run_dir(base_dir=base_dir, lam=lam, alpha=alpha, m0=m0)
 
     if run_dir is None:
         raise FileNotFoundError(
@@ -53,6 +45,11 @@ def load_run_for_asymptotics(base_dir, lam, alpha, m0):
     if snapshots is None:
         raise FileNotFoundError(f"No snapshots.npz found in {run_dir}")
 
+    c = summary.get("wave_speed", None)
+
+    if c is None or not np.isfinite(float(c)):
+        raise ValueError(f"No valid wave speed in {run_dir}")
+
     return {
         "run_dir": Path(run_dir),
         "summary": summary,
@@ -60,7 +57,7 @@ def load_run_for_asymptotics(base_dir, lam, alpha, m0):
         "times": snapshots["times"],
         "U": snapshots["N_arr"],
         "M": snapshots["M_arr"],
-        "c": float(summary["wave_speed"]),
+        "c": float(c),
         "lambda": float(summary.get("lambda", summary.get("lambda_val", lam))),
         "alpha": float(summary.get("alpha", alpha)),
         "m0": float(summary.get("m0", m0)),
@@ -89,12 +86,7 @@ def front_location_at_time(
     if spline_type == "pchip":
         spline = PchipInterpolator(x_local, u_local, extrapolate=True)
     elif spline_type == "linear":
-        spline = interp1d(
-            x_local,
-            u_local,
-            kind="linear",
-            fill_value="extrapolate",
-        )
+        spline = interp1d(x_local, u_local, kind="linear", fill_value="extrapolate")
     else:
         raise ValueError("Use spline_type='pchip' or spline_type='linear'.")
 
@@ -124,62 +116,101 @@ def front_location_at_time(
     return None
 
 
-def best_center_for_time(
+def find_best_front_snapshot(
     x,
     U,
     times,
-    t_ref,
     threshold=0.5,
     band=(0.1, 0.9),
     spline_type="pchip",
-    fallback_thresholds=(0.45, 0.55),
+    prefer_middle=True,
 ):
-    idx = int(np.argmin(np.abs(times - t_ref)))
+    """
+    Find a saved snapshot that contains a trackable U=threshold front.
 
-    x_front = front_location_at_time(
-        x=x,
-        u_row=U[idx],
-        threshold=threshold,
-        band=band,
-        spline_type=spline_type,
-    )
+    If prefer_middle=True, choose a valid front closest to the middle
+    of the saved time interval. This avoids very early/very late snapshots.
+    """
+    valid = []
 
-    if x_front is not None:
-        return idx, x_front
-
-    for threshold_try in fallback_thresholds:
+    for idx, t in enumerate(times):
         x_front = front_location_at_time(
             x=x,
             u_row=U[idx],
-            threshold=threshold_try,
-            band=(0.05, 0.95),
+            threshold=threshold,
+            band=band,
             spline_type=spline_type,
         )
 
         if x_front is not None:
-            return idx, x_front
+            valid.append((idx, float(t), float(x_front)))
 
-    return idx, 0.5 * (x[0] + x[-1])
+    if not valid:
+        return None, None, None
+
+    if not prefer_middle:
+        return valid[0]
+
+    t_mid = 0.5 * (float(times[0]) + float(times[-1]))
+    return min(valid, key=lambda item: abs(item[1] - t_mid))
 
 
 def centre_snapshot_at_front(
     x,
     U,
     times,
-    t_ref,
+    t_ref="auto",
     threshold=0.5,
     band=(0.1, 0.9),
     spline_type="pchip",
+    strict=True,
 ):
-    idx, x_front = best_center_for_time(
+    if t_ref == "auto":
+        idx, t_used, x_front = find_best_front_snapshot(
+            x=x,
+            U=U,
+            times=times,
+            threshold=threshold,
+            band=band,
+            spline_type=spline_type,
+        )
+
+        if x_front is None:
+            raise ValueError("No trackable front found in any saved snapshot.")
+
+        xi = x - x_front
+        return xi, U[idx], idx, x_front
+
+    idx = int(np.argmin(np.abs(times - t_ref)))
+    u_row = U[idx]
+
+    x_front = front_location_at_time(
         x=x,
-        U=U,
-        times=times,
-        t_ref=t_ref,
+        u_row=u_row,
         threshold=threshold,
         band=band,
         spline_type=spline_type,
     )
+
+    if x_front is None:
+        if strict:
+            raise ValueError(
+                f"No trackable U={threshold} front near t={t_ref}. "
+                f"Snapshot time used was t={times[idx]:.4g}."
+            )
+
+        idx, t_used, x_front = find_best_front_snapshot(
+            x=x,
+            U=U,
+            times=times,
+            threshold=threshold,
+            band=band,
+            spline_type=spline_type,
+        )
+
+        if x_front is None:
+            x_front = 0.5 * (x[0] + x[-1])
+            idx = int(np.argmin(np.abs(times - t_ref)))
 
     xi = x - x_front
     return xi, U[idx], idx, x_front
@@ -193,13 +224,7 @@ def x_at_half(x, u):
         x = x[::-1]
         u = u[::-1]
 
-    f = interp1d(
-        u,
-        x,
-        bounds_error=False,
-        fill_value="extrapolate",
-    )
-
+    f = interp1d(u, x, bounds_error=False, fill_value="extrapolate")
     return float(f(0.5))
 
 

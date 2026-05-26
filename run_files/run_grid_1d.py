@@ -1,315 +1,361 @@
-# src/tumour_ecm/plotting/travelling_wave_grid.py
+# run_files/run_grid_1d.py
 
 import os
+import sys
+import math
+import json
 from pathlib import Path
 
-import numpy as np
-import matplotlib.pyplot as plt
+from joblib import Parallel, delayed
 
-from tumour_ecm.utils.io import find_run_dir, load_snapshots, load_summary
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+sys.path.insert(0, str(SRC))
 
-
-def _nearest_indices(times, t_points):
-    times = np.asarray(times, dtype=float)
-
-    return [
-        int(np.argmin(np.abs(times - t)))
-        for t in t_points
-    ]
-
-
-def _resolve_colors(color_scheme):
-    if color_scheme == "opt1":
-        return "#1f77b4", "#d62728"      # ECM blue, tumour red
-
-    if color_scheme == "opt2":
-        return "#1f77b4", "#ff8c00"      # ECM blue, tumour orange
-
-    if color_scheme == "opt3":
-        return "#6a00a8", "#ff8c00"      # ECM purple, tumour orange
-
-    return "#1f77b4", "#ff8c00"
+from tumour_ecm.solvers.tumour_ecm_1d import TumourECM1D
+from tumour_ecm.utils.io import (
+    safe_tag,
+    ensure_dir,
+    save_json,
+    save_snapshots,
+    save_fronts,
+)
 
 
-def _load_speed(run_dir, which="N"):
-    summary = load_summary(run_dir)
-
-    if not summary:
-        return np.nan
-
-    key = "wave_speed" if which.upper() == "N" else "m_wave_speed"
-    value = summary.get(key, np.nan)
-
-    try:
-        value = float(value)
-        return value if np.isfinite(value) else np.nan
-    except Exception:
-        return np.nan
+def is_missing(value):
+    return value is None or (isinstance(value, float) and math.isnan(value))
 
 
-def _format_param(value):
-    value = float(value)
+def append_jsonl(path, item):
+    """
+    Append one JSON object as one line.
 
-    if value == 0:
-        return "0"
+    This is safer for long sweeps because results are written immediately,
+    rather than only at the end of the whole Parallel call.
+    """
+    path = Path(path)
+    ensure_dir(path.parent)
 
-    if abs(value) >= 1000 or abs(value) <= 0.001:
-        exponent = int(np.round(np.log10(abs(value))))
-        mantissa = value / (10 ** exponent)
-
-        if np.isclose(mantissa, 1.0):
-            return f"10^{exponent}"
-
-        return f"{mantissa:.2g}×10^{exponent}"
-
-    return f"{value:g}"
+    with open(path, "a") as f:
+        f.write(json.dumps(item) + "\n")
 
 
-def plot_travelling_wave_alpha_lambda_grid(
-    base_dir,
-    alpha_vals,
-    lambda_vals,
+def run_one(
+    lam,
     m0,
-    t_points=(0, 100, 200, 300, 400),
-    yticks_mode="basic",
-    show_arrows=True,
-    show_speed_text=True,
-    color_scheme="opt2",
-    figsize=(13.6, 10.0),
-    save=False,
-    out_path=None,
-    dpi=600,
+    alpha,
+    base_dir,
+    model_kwargs,
+    overwrite=False,
+    r2_cutoff=0.999,
 ):
-    """
-    Dissertation-style travelling-wave grid.
-
-    Columns:
-        alpha values.
-
-    Rows:
-        lambda values.
-
-    Fixed:
-        m0.
-
-    Uses saved outputs from:
-
-        outputs/sweeps/tumour_ecm_1d/
-            alpha_*/
-                lambda_*/
-                    m0_*/
-                        snapshots.npz
-                        summary.json
-    """
     base_dir = Path(base_dir)
 
-    alpha_vals = list(alpha_vals)
-    lambda_vals = list(lambda_vals)
+    live_completed_path = base_dir / "live_completed_runs.jsonl"
+    live_untracked_path = base_dir / "live_untracked_runs.jsonl"
+    live_failed_path = base_dir / "live_failed_runs.jsonl"
 
-    nrows = len(lambda_vals)
-    ncols = len(alpha_vals)
+    try:
+        alpha_dir = base_dir / f"alpha_{safe_tag(alpha)}"
+        lambda_dir = alpha_dir / f"lambda_{safe_tag(lam)}"
+        run_dir = lambda_dir / f"m0_{safe_tag(m0)}"
 
-    m_color, u_color = _resolve_colors(color_scheme)
+        summary_path = run_dir / "summary.json"
 
-    fig, axes = plt.subplots(
-        nrows,
-        ncols,
-        figsize=figsize,
-        squeeze=False,
-        sharex=True,
-        sharey=True,
+        if summary_path.exists() and not overwrite:
+            skipped_item = {
+                "status": "skipped",
+                "lambda": float(lam),
+                "m0": float(m0),
+                "alpha": float(alpha),
+                "run_dir": str(run_dir),
+                "reason": "summary_exists",
+            }
+            return ("skipped", skipped_item)
+
+        ensure_dir(run_dir)
+
+        model = TumourECM1D(
+            lam=lam,
+            m0=m0,
+            alpha=alpha,
+            **model_kwargs,
+        )
+
+        print(f"Running alpha={alpha}, lambda={lam}, m0={m0}")
+        model.solve()
+
+        cN, bN, r2N = model.estimate_wave_speed(
+            threshold=0.5,
+            band=(0.1, 0.9),
+            spline_type="cubic",
+            plot=False,
+            target="N",
+        )
+
+        model.wave_speed = cN
+
+        m_threshold = 0.5 * float(m0)
+        cM, bM, r2M = None, None, None
+
+        if m_threshold > 0:
+            try:
+                cM, bM, r2M = model.estimate_wave_speed(
+                    threshold=m_threshold,
+                    band=(0.1, 0.9),
+                    spline_type="cubic",
+                    plot=False,
+                    target="M",
+                )
+            except Exception:
+                cM, bM, r2M = None, None, None
+
+        no_n_speed = is_missing(cN)
+        low_r2_n = (
+            not no_n_speed
+            and (is_missing(r2N) or float(r2N) < r2_cutoff)
+        )
+
+        no_m_speed = m_threshold > 0 and is_missing(cM)
+        low_r2_m = (
+            m_threshold > 0
+            and not no_m_speed
+            and (is_missing(r2M) or float(r2M) < r2_cutoff)
+        )
+
+        untracked_reasons = []
+
+        if no_n_speed:
+            untracked_reasons.append("NO_N_SPEED")
+
+        if low_r2_n:
+            untracked_reasons.append("LOW_N_R2")
+
+        if no_m_speed:
+            untracked_reasons.append("NO_M_SPEED")
+
+        if low_r2_m:
+            untracked_reasons.append("LOW_M_R2")
+
+        summary = {
+            "lambda": float(lam),
+            "m0": float(m0),
+            "alpha": float(alpha),
+
+            "wave_speed": float(cN) if not no_n_speed else None,
+            "r2": float(r2N) if not is_missing(r2N) else None,
+
+            "m_threshold": float(m_threshold),
+            "m_wave_speed": float(cM) if not is_missing(cM) else None,
+            "m_r2": float(r2M) if not is_missing(r2M) else None,
+
+            "untracked": bool(untracked_reasons),
+            "untracked_reasons": untracked_reasons,
+            "r2_cutoff": float(r2_cutoff),
+
+            "L": model.L,
+            "N": model.N,
+            "T": model.T,
+            "dt": model.dt,
+            "init_type": model.init_type,
+            "steepness": model.steepness,
+            "perc": model.perc,
+            "saved_stride": 150,
+            "run_dir": str(run_dir),
+        }
+
+        save_json(summary_path, summary)
+        save_snapshots(run_dir, model, stride=150)
+
+        if not no_n_speed:
+            save_fronts(run_dir, model, target="N", threshold=0.5)
+
+        if m_threshold > 0 and not no_m_speed:
+            save_fronts(run_dir, model, target="M", threshold=m_threshold)
+
+        completed_item = {
+            "status": "done",
+            "lambda": float(lam),
+            "m0": float(m0),
+            "alpha": float(alpha),
+            "wave_speed": float(cN) if not is_missing(cN) else None,
+            "r2": float(r2N) if not is_missing(r2N) else None,
+            "m_wave_speed": float(cM) if not is_missing(cM) else None,
+            "m_r2": float(r2M) if not is_missing(r2M) else None,
+            "untracked": bool(untracked_reasons),
+            "untracked_reasons": untracked_reasons,
+            "run_dir": str(run_dir),
+        }
+
+        append_jsonl(live_completed_path, completed_item)
+
+        if untracked_reasons:
+            append_jsonl(live_untracked_path, completed_item)
+
+        return ("done", completed_item)
+
+    except Exception as e:
+        failed_item = {
+            "status": "failed",
+            "lambda": float(lam),
+            "m0": float(m0),
+            "alpha": float(alpha),
+            "error": str(e),
+        }
+
+        append_jsonl(live_failed_path, failed_item)
+
+        return ("failed", failed_item)
+
+
+def read_jsonl(path):
+    path = Path(path)
+
+    if not path.exists():
+        return []
+
+    items = []
+
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+
+            if not line:
+                continue
+
+            try:
+                items.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    return items
+
+
+def main():
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+    base_dir = ROOT / "outputs" / "sweeps" / "tumour_ecm_1d"
+    ensure_dir(base_dir)
+
+    lambda_vals = [0.001, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 100.0, 1000.0]
+    m0_vals = [0.05, 0.1, 0.2, 0.5, 0.8, 0.9]
+    alpha_vals = [0.0, 0.001, 0.01, 0.05, 0.1, 0.5, 1.0, 10.0, 100.0, 1000.0]
+
+    r2_cutoff = 0.999
+
+    model_kwargs = dict(
+        L=200,
+        N=20001,
+        T=200,
+        dt=0.1,
+        D=1.0,
+        rho=1.0,
+        K=1.0,
+        n0=1.0,
+        Mmax=1.0,
+        init_type="tanh",
+        steepness=0.85,
+        perc=0.4,
+        t_start=60,
+        t_end=180,
+        num_points=200,
     )
 
-    fig.patch.set_facecolor("white")
+    tasks = [
+        (lam, m0, alpha)
+        for alpha in alpha_vals
+        for lam in lambda_vals
+        for m0 in m0_vals
+    ]
 
-    # Column titles: alpha values
-    for j, alpha in enumerate(alpha_vals):
-        axes[0, j].set_title(
-            f"alpha = {_format_param(alpha)}",
-            fontsize=18,
-            pad=8,
-        )
+    print(f"Running {len(tasks)} simulations...")
+    print(f"Saving to: {base_dir}")
+    print(f"Live untracked log: {base_dir / 'live_untracked_runs.jsonl'}")
+    print(f"Live failed log: {base_dir / 'live_failed_runs.jsonl'}")
 
-    legend_handles = None
-
-    if yticks_mode == "basic":
-        shared_ylim = (0.0, 1.05)
-        yticks = [0.0, 0.5, 1.0]
-
-    elif yticks_mode == "split":
-        shared_ylim = (0.0, 1.05)
-        yticks = np.arange(0.0, 1.01, 0.2)
-
-    elif yticks_mode == "splitplus":
-        shared_ylim = (0.0, 1.25)
-        yticks = np.arange(0.0, 1.21, 0.2)
-
-    else:
-        shared_ylim = (0.0, 1.05)
-        yticks = [0.0, 0.5, 1.0]
-
-    for i, lam in enumerate(lambda_vals):
-        # Row label on far left
-        axes[i, 0].text(
-            -0.25,
-            0.5,
-            f"lambda = {_format_param(lam)}",
-            transform=axes[i, 0].transAxes,
-            ha="center",
-            va="center",
-            fontsize=22,
-            fontweight="bold",
-            rotation=90,
-        )
-
-        for j, alpha in enumerate(alpha_vals):
-            ax = axes[i, j]
-
-            ax.grid(False)
-            ax.set_ylim(shared_ylim)
-            ax.set_yticks(yticks)
-
-            if j > 0:
-                ax.set_yticklabels([])
-            else:
-                ax.set_ylabel("u, m", fontsize=18)
-
-            if i < nrows - 1:
-                ax.set_xticklabels([])
-
-            run_dir = find_run_dir(
-                base_dir=base_dir,
+    try:
+        results = Parallel(n_jobs=4, verbose=10)(
+            delayed(run_one)(
                 lam=lam,
                 m0=m0,
                 alpha=alpha,
+                base_dir=base_dir,
+                model_kwargs=model_kwargs,
+                overwrite=False,
+                r2_cutoff=r2_cutoff,
             )
-
-            snap = load_snapshots(run_dir)
-
-            if snap is None:
-                ax.text(
-                    0.5,
-                    0.5,
-                    "missing run",
-                    transform=ax.transAxes,
-                    ha="center",
-                    va="center",
-                    fontsize=13,
-                )
-                continue
-
-            x = snap["x"]
-            times = snap["times"]
-            U = snap["N_arr"]
-            M = snap["M_arr"]
-
-            L = float(x[-1])
-
-            ax.set_xlim(0.0, L)
-            ax.tick_params(axis="x", labelsize=14)
-            ax.tick_params(axis="y", labelsize=14)
-
-            t_indices = _nearest_indices(times, t_points)
-
-            h_u = None
-            h_m = None
-
-            for k, idx in enumerate(t_indices):
-                linestyle = "--" if k == 0 else "-"
-
-                h_u, = ax.plot(
-                    x,
-                    U[idx],
-                    color=u_color,
-                    linestyle=linestyle,
-                    linewidth=2.0,
-                )
-
-                h_m, = ax.plot(
-                    x,
-                    M[idx],
-                    color=m_color,
-                    linestyle=linestyle,
-                    linewidth=2.0,
-                )
-
-            if legend_handles is None and h_u is not None and h_m is not None:
-                legend_handles = [h_u, h_m]
-
-            if show_arrows:
-                ax.annotate(
-                    "",
-                    xy=(0.85 * L, 0.8),
-                    xytext=(0.70 * L, 0.8),
-                    arrowprops=dict(
-                        arrowstyle="->",
-                        lw=2.3,
-                        color=u_color,
-                    ),
-                )
-
-                ax.annotate(
-                    "",
-                    xy=(0.85 * L, 0.25),
-                    xytext=(0.70 * L, 0.25),
-                    arrowprops=dict(
-                        arrowstyle="->",
-                        lw=2.3,
-                        color=m_color,
-                    ),
-                )
-
-            if show_speed_text:
-                c = _load_speed(run_dir, which="N")
-
-                if np.isfinite(c):
-                    ax.text(
-                        0.03,
-                        0.86,
-                        f"c = {c:.3g}",
-                        transform=ax.transAxes,
-                        fontsize=18,
-                        ha="left",
-                        va="top",
-                    )
-
-    for ax in axes[-1, :]:
-        ax.set_xlabel("x", fontsize=18)
-
-    fig.suptitle(
-        f"Numerical solutions at m0 = {m0}",
-        fontsize=20,
-        y=0.98,
-    )
-
-    plt.subplots_adjust(
-        left=0.12,
-        right=0.96,
-        top=0.90,
-        bottom=0.12,
-        wspace=0.08,
-        hspace=0.24,
-    )
-
-    if legend_handles is not None:
-        fig.legend(
-            legend_handles,
-            ["u(x,t) tumour", "m(x,t) ECM"],
-            loc="lower center",
-            ncol=2,
-            frameon=False,
-            fontsize=16,
-            bbox_to_anchor=(0.5, 0.02),
+            for lam, m0, alpha in tasks
         )
 
-    if save:
-        if out_path is None:
-            out_path = f"plots/travelling_wave_grid_m0_{str(m0).replace('.', 'p')}"
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
+        print("Completed/untracked/failed runs already finished are still in the live .jsonl logs.")
+        raise
 
-        out_path = Path(out_path)
-        os.makedirs(out_path.parent, exist_ok=True)
+    done = []
+    skipped = []
+    failed = []
+    untracked = []
 
-        fig.savefig(str(out_path) + ".pdf", bbox_inches="tight")
-        fig.savefig(str(out_path) + ".png", dpi=dpi, bbox_inches="tight")
+    for tag, item in results:
+        if tag == "done":
+            done.append(item)
 
-    return fig, axes
+            if item.get("untracked", False):
+                untracked.append(item)
+
+        elif tag == "skipped":
+            skipped.append(item)
+
+        elif tag == "failed":
+            failed.append(item)
+
+    report = {
+        "counts": {
+            "done": len(done),
+            "skipped": len(skipped),
+            "failed": len(failed),
+            "untracked": len(untracked),
+        },
+        "r2_cutoff": r2_cutoff,
+        "lambda_vals": lambda_vals,
+        "m0_vals": m0_vals,
+        "alpha_vals": alpha_vals,
+        "model_kwargs": model_kwargs,
+        "done_runs": done,
+        "skipped_runs": skipped,
+        "failed_runs": failed,
+        "untracked_runs": untracked,
+    }
+
+    save_json(base_dir / "grid_run_report.json", report)
+    save_json(base_dir / "failed_runs.json", failed)
+    save_json(base_dir / "untracked_runs.json", untracked)
+
+    print("\nGrid run complete.")
+    print(f"Done:       {len(done)}")
+    print(f"Skipped:    {len(skipped)}")
+    print(f"Failed:     {len(failed)}")
+    print(f"Untracked:  {len(untracked)}")
+
+    print("\nLive logs written to:")
+    print(base_dir / "live_completed_runs.jsonl")
+    print(base_dir / "live_untracked_runs.jsonl")
+    print(base_dir / "live_failed_runs.jsonl")
+
+    if untracked:
+        print("\nUntracked examples:")
+        for item in untracked[:10]:
+            print(item)
+
+    if failed:
+        print("\nFailed examples:")
+        for item in failed[:10]:
+            print(item)
+
+
+if __name__ == "__main__":
+    main()
