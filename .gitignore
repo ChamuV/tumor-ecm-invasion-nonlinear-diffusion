@@ -1,4 +1,5 @@
-# Python cache
+cat > .gitignore <<'EOF'
+# Python
 __pycache__/
 *.py[cod]
 
@@ -6,26 +7,21 @@ __pycache__/
 .venv/
 venv/
 
-# macOS
-.DS_Store
+# Outputs / generated data
+outputs/
+data/
 
 # Jupyter
 .ipynb_checkpoints/
 
-# Simulation outputs / data
-outputs/
-data/
-
-# Logs
-*.log
-*.jsonl
+# macOS
+.DS_Store
 
 # IDE
 .vscode/
 .idea/
 
-# Coverage / build
-.coverage
-htmlcov/
-dist/
-build/
+# Logs
+*.log
+*.jsonl
+EOF
